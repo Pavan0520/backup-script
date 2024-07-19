@@ -1,0 +1,107 @@
+SCRIPT WITH NO DUPLICATION COPY FILES
+
+
+#!/bin/bash
+
+# Calculate the date for yesterday
+yesterday=$(date --date="yesterday" +"%Y-%m-%d")
+
+# Source and destination directories
+source_dir="/var/www/html/calls/$yesterday"
+destination_dir="/root/DB_Backup/callrecordings/$yesterday"
+
+# Custom metrics file
+metrics_file="/tmp/backup_metrics.prom"
+metrics_port="9101"
+
+# Function to record metrics
+record_metrics() {
+    local backup_status="$1"
+    local source_files_count="$2"
+    local newly_copied_files_count="$3"
+    local source_size="$4"
+    local dest_size="$5"
+
+    # Convert sizes to MB
+    source_size_mb=$(echo "scale=2; $source_size / 1024 / 1024" | bc)
+    dest_size_mb=$(echo "scale=2; $dest_size / 1024 / 1024" | bc)
+
+    echo "# HELP backup_status Indicates the status of the backup process (0=failed, 1=success)" > "$metrics_file"
+    echo "# TYPE backup_status gauge" >> "$metrics_file"
+    echo "backup_status $backup_status" >> "$metrics_file"
+
+    echo "# HELP source_files_count Number of files in the source directory" >> "$metrics_file"
+    echo "# TYPE source_files_count gauge" >> "$metrics_file"
+    echo "source_files_count $source_files_count" >> "$metrics_file"
+
+    echo "# HELP newly_copied_files_count Number of newly copied files in the destination directory" >> "$metrics_file"
+    echo "# TYPE newly_copied_files_count gauge" >> "$metrics_file"
+    echo "newly_copied_files_count $newly_copied_files_count" >> "$metrics_file"
+
+    echo "# HELP source_directory_size_mb Size of the source directory in megabytes" >> "$metrics_file"
+    echo "# TYPE source_directory_size_mb gauge" >> "$metrics_file"
+    echo "source_directory_size_mb $source_size_mb" >> "$metrics_file"
+
+    echo "# HELP destination_directory_size_mb Size of the destination directory in megabytes" >> "$metrics_file"
+    echo "# TYPE destination_directory_size_mb gauge" >> "$metrics_file"
+    echo "destination_directory_size_mb $dest_size_mb" >> "$metrics_file"
+}
+
+# Function to expose metrics on HTTP endpoint
+expose_metrics() {
+    echo "Starting HTTP server on port $metrics_port..."
+    #nohup python3 -m http.server $metrics_port --bind 0.0.0.0 --directory /tmp > /tmp/http_server.log 2>&1 &
+    nohup python3 metrics_server.py > /dev/null 2>&1 &
+    sleep 2  # Give it some time to start
+    echo "HTTP server started."
+}
+
+# Check if the source directory exists and is not empty
+if [ ! -d "$source_dir" ] || [ -z "$(ls -A "$source_dir")" ]; then
+    echo "Source directory $source_dir does not exist or is empty."
+    # Record the metrics with backup status failed
+    record_metrics 0 0 0 0 0
+    exit 1  # Exit script with failure status
+fi
+
+# Create the destination directory if it doesn't exist
+if [ ! -d "$destination_dir" ]; then
+    mkdir -p "$destination_dir"
+fi
+
+# Count the number of files in the source directory
+source_files_count=$(find "$source_dir" -type f | wc -l)
+
+# Get initial number of files in destination directory
+initial_dest_files_count=$(find "$destination_dir" -type f | wc -l)
+
+# Get size of source directory
+source_size=$(du -sb "$source_dir" | awk '{print $1}')
+
+# Get initial size of destination directory
+initial_dest_size=$(du -sb "$destination_dir" 2>/dev/null | awk '{print $1}')
+initial_dest_size=${initial_dest_size:-0}
+
+# Copy all files from source to destination
+rsync -av --ignore-existing "$source_dir/" "$destination_dir/"
+
+# Check if the copy was successful
+if [ $? -eq 0 ]; then
+    echo "Backup completed successfully."
+    # Get new number of files in destination directory
+    final_dest_files_count=$(find "$destination_dir" -type f | wc -l)
+    # Calculate the number of newly copied files
+    newly_copied_files_count=$((final_dest_files_count - initial_dest_files_count))
+    # Get new total size of destination directory
+    new_dest_size=$(du -sb "$destination_dir" | awk '{print $1}')
+    # Record the metrics with backup status success
+    record_metrics 1 "$source_files_count" "$newly_copied_files_count" "$source_size" "$new_dest_size"
+else
+    echo "Backup failed during copy operation."
+    # Record the metrics with backup status failed
+    record_metrics 0 "$source_files_count" 0 "$source_size" "$initial_dest_size"
+    exit 1  # Exit script with failure status
+fi
+
+# Expose metrics
+expose_metrics
